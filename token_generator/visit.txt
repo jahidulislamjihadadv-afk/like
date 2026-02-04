@@ -1,0 +1,12 @@
+# Visit Token Credentials
+# Format: uid,password
+# One account per line
+# These tokens will be saved to token_bd_visit.json
+
+# Example:
+# 1234567890,YOUR_PASSWORD_HERE
+# 9876543210,ANOTHER_PASSWORD
+
+4434729344,DELTA_C3COD_BY_KALLU_CODEX_PU6HU
+4434756478,DELTA_MNX0E_BY_KALLU_CODEX_TRTE7
+4449309987,ZIHAD_6XAQJ_BY_KALLU_CODEX_U1GEA
