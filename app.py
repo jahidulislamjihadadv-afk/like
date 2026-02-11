@@ -435,7 +435,7 @@ scheduler.start()
 scheduler.add_job(
     func=refresh_tokens_task,
     trigger="interval",
-    hours=8,
+    hours=2,
     id='token_refresh_job',
     name='Auto Token Refresh',
     replace_existing=True
