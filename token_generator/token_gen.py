@@ -60,9 +60,9 @@ async def encrypt_proto(encoded_hex):
 
 # =================== TOKEN GENERATION ===================
 
-async def get_access_token(uid, password):
+async def get_access_token(uid, password, retry=0, max_retries=3):
     """
-    Step 1: Get access token from Garena OAuth
+    Step 1: Get access token from Garena OAuth with retry logic
     """
     url = "https://100067.connect.garena.com/oauth/guest/token/grant"
     
@@ -83,24 +83,48 @@ async def get_access_token(uid, password):
         "client_id": "100067"
     }
     
-    print(f"📡 Requesting access token for UID: {uid}...")
+    if retry == 0:
+        print(f"📡 Requesting access token for UID: {uid}...")
+    else:
+        print(f"🔄 Retry {retry}/{max_retries} for UID: {uid}...")
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, headers=headers, data=data) as response:
-            if response.status != 200:
-                print(f"❌ Failed to get access token: HTTP {response.status}")
-                return None, None
-            
-            data = await response.json()
-            open_id = data.get("open_id")
-            access_token = data.get("access_token")
-            
-            if open_id and access_token:
-                print(f"✅ Access token obtained")
-                return open_id, access_token
-            else:
-                print(f"❌ Invalid response from Garena OAuth")
-                return None, None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, headers=headers, data=data, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status != 200:
+                    if retry < max_retries:
+                        await asyncio.sleep(2 ** retry)  # Exponential backoff
+                        return await get_access_token(uid, password, retry + 1, max_retries)
+                    print(f"❌ Failed to get access token: HTTP {response.status}")
+                    return None, None
+                
+                resp_data = await response.json()
+                open_id = resp_data.get("open_id")
+                access_token = resp_data.get("access_token")
+                
+                if open_id and access_token:
+                    print(f"✅ Access token obtained")
+                    return open_id, access_token
+                else:
+                    if retry < max_retries:
+                        await asyncio.sleep(2 ** retry)
+                        return await get_access_token(uid, password, retry + 1, max_retries)
+                    print(f"❌ Invalid response from Garena OAuth")
+                    return None, None
+    except asyncio.TimeoutError:
+        if retry < max_retries:
+            print(f"⏱️  Timeout, retrying...")
+            await asyncio.sleep(2 ** retry)
+            return await get_access_token(uid, password, retry + 1, max_retries)
+        print(f"❌ Timeout after {max_retries} retries")
+        return None, None
+    except Exception as e:
+        if retry < max_retries:
+            print(f"⚠️  Error: {str(e)[:50]}, retrying...")
+            await asyncio.sleep(2 ** retry)
+            return await get_access_token(uid, password, retry + 1, max_retries)
+        print(f"❌ Error: {str(e)[:100]}")
+        return None, None
 
 async def create_major_login_payload(open_id, access_token):
     """
@@ -182,9 +206,9 @@ async def create_major_login_payload(open_id, access_token):
     string = major_login.SerializeToString()
     return await encrypt_proto(string)
 
-async def perform_major_login(payload):
+async def perform_major_login(payload, retry=0, max_retries=3):
     """
-    Step 3: Send MajorLogin request to Free Fire server
+    Step 3: Send MajorLogin request to Free Fire server with retry logic
     """
     url = "https://loginbp.ggblueshark.com/MajorLogin"
     
@@ -199,20 +223,41 @@ async def perform_major_login(payload):
         'ReleaseVersion': "OB52"
     }
     
-    print(f"🔐 Performing MajorLogin...")
+    if retry == 0:
+        print(f"🔐 Performing MajorLogin...")
+    else:
+        print(f"🔄 Retry {retry}/{max_retries} for MajorLogin...")
     
     ssl_context = ssl.create_default_context()
     ssl_context.check_hostname = False
     ssl_context.verify_mode = ssl.CERT_NONE
     
-    async with aiohttp.ClientSession() as session:
-        async with session.post(url, data=payload, headers=headers, ssl=ssl_context) as response:
-            if response.status == 200:
-                print(f"✅ MajorLogin successful")
-                return await response.read()
-            else:
-                print(f"❌ MajorLogin failed: HTTP {response.status}")
-                return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, data=payload, headers=headers, ssl=ssl_context, timeout=aiohttp.ClientTimeout(total=15)) as response:
+                if response.status == 200:
+                    print(f"✅ MajorLogin successful")
+                    return await response.read()
+                else:
+                    if retry < max_retries:
+                        await asyncio.sleep(2 ** retry)
+                        return await perform_major_login(payload, retry + 1, max_retries)
+                    print(f"❌ MajorLogin failed: HTTP {response.status}")
+                    return None
+    except asyncio.TimeoutError:
+        if retry < max_retries:
+            print(f"⏱️  Timeout, retrying...")
+            await asyncio.sleep(2 ** retry)
+            return await perform_major_login(payload, retry + 1, max_retries)
+        print(f"❌ Timeout after {max_retries} retries")
+        return None
+    except Exception as e:
+        if retry < max_retries:
+            print(f"⚠️  Error: {str(e)[:50]}, retrying...")
+            await asyncio.sleep(2 ** retry)
+            return await perform_major_login(payload, retry + 1, max_retries)
+        print(f"❌ Error: {str(e)[:100]}")
+        return None
 
 async def parse_major_login_response(response_data):
     """
@@ -377,7 +422,7 @@ async def main():
             await save_token(token_obj)
     
     elif len(sys.argv) == 2 and sys.argv[1] == "--batch":
-        # Batch generation from credentials.txt
+        # Batch generation from credentials.txt (PARALLEL)
         print("📂 Batch mode: Loading credentials from credentials.txt")
         credentials = await load_credentials_from_file("credentials.txt")
         
@@ -388,23 +433,66 @@ async def main():
         
         print(f"📋 Found {len(credentials)} accounts\n")
         
+        # Parallel batch processing (2 at a time to avoid rate limiting)
         success_count = 0
-        for i, (uid, password) in enumerate(credentials, 1):
-            print(f"\n{'='*60}")
-            print(f"Processing account {i}/{len(credentials)}")
-            print(f"{'='*60}")
-            
-            token_obj = await generate_token(uid, password)
-            if token_obj:
-                await save_token(token_obj)
-                success_count += 1
-            
-            # Small delay between requests
-            if i < len(credentials):
-                await asyncio.sleep(2)
+        failed_accounts = []
+        batch_size = 2
         
         print(f"\n{'='*60}")
-        print(f"✅ Batch complete: {success_count}/{len(credentials)} tokens generated")
+        print(f"🚀 PARALLEL BATCH PROCESSING (2 at a time)")
+        print(f"{'='*60}\n")
+        
+        for batch_start in range(0, len(credentials), batch_size):
+            batch_end = min(batch_start + batch_size, len(credentials))
+            batch = credentials[batch_start:batch_end]
+            
+            print(f"\n📦 Processing batch {batch_start // batch_size + 1}/{(len(credentials) + batch_size - 1) // batch_size}")
+            print(f"   Accounts: {batch_start + 1}-{batch_end} of {len(credentials)}")
+            print(f"{'='*60}")
+            
+            # Run 2 tokens in parallel
+            tasks = []
+            for uid, password in batch:
+                tasks.append(generate_token(uid, password))
+            
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Save tokens and track failures
+            for (uid, password), result in zip(batch, results):
+                if result and isinstance(result, dict):
+                    try:
+                        await save_token(result)
+                        success_count += 1
+                        print(f"✅ {uid}: Token saved")
+                    except Exception as e:
+                        failed_accounts.append((uid, f"Save error: {str(e)[:30]}"))
+                        print(f"❌ {uid}: Failed to save ({str(e)[:30]})")
+                else:
+                    failed_accounts.append((uid, "Generation failed" if result is None else str(result)[:50]))
+                    print(f"❌ {uid}: Generation failed")
+            
+            # Small delay between batches
+            if batch_end < len(credentials):
+                await asyncio.sleep(1)
+        
+        print(f"\n{'='*60}")
+        print(f"✅ BATCH COMPLETE")
+        print(f"{'='*60}")
+        print(f"✅ Success: {success_count}/{len(credentials)} tokens generated")
+        print(f"❌ Failed: {len(failed_accounts)} accounts")
+        
+        if failed_accounts:
+            print(f"\n📋 Failed accounts:")
+            for uid, reason in failed_accounts:
+                print(f"   • {uid}: {reason}")
+            
+            # Save failed accounts for retry
+            with open("failed_accounts.txt", "w") as f:
+                for uid, password in credentials:
+                    if any(failed[0] == uid for failed in failed_accounts):
+                        f.write(f"{uid},{password}\n")
+            print(f"\n💾 Failed accounts saved to failed_accounts.txt for retry")
+        
         print(f"{'='*60}\n")
     
     else:

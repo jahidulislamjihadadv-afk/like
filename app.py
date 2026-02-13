@@ -13,8 +13,10 @@ import threading
 import urllib3
 import random
 from apscheduler.schedulers.background import BackgroundScheduler
-from datetime import datetime
+from datetime import datetime, timedelta
 import atexit
+import os
+import base64
 
 # Configuration
 TOKEN_BATCH_SIZE = 189
@@ -71,6 +73,167 @@ def get_random_batch_tokens(server_name, all_tokens):
     # Randomly select tokens without replacement
     return random.sample(all_tokens, TOKEN_BATCH_SIZE)
 
+def get_token_health(token_str):
+    """Check if token is valid and return expiry info"""
+    try:
+        parts = token_str.split('.')
+        if len(parts) != 3:
+            return None
+        
+        payload = parts[1]
+        padding = 4 - len(payload) % 4
+        if padding != 4:
+            payload += '=' * padding
+        
+        decoded = base64.urlsafe_b64decode(payload)
+        token_data = json.loads(decoded)
+        
+        exp_timestamp = token_data.get('exp')
+        if not exp_timestamp:
+            return None
+        
+        expiry_dt = datetime.fromtimestamp(exp_timestamp)
+        now = datetime.now()
+        days_left = (expiry_dt - now).days
+        
+        return {
+            'is_valid': days_left > 0,
+            'days_left': days_left,
+            'expiry_datetime': expiry_dt,
+            'account_id': token_data.get('account_id'),
+            'nickname': token_data.get('nickname', 'N/A'),
+            'region': token_data.get('noti_region') or token_data.get('lock_region')
+        }
+    except Exception as e:
+        print(f"Error checking token health: {e}")
+        return None
+
+def cleanup_expired_tokens(filepath):
+    """Remove expired tokens from a json file and save"""
+    try:
+        if not os.path.exists(filepath):
+            return 0, 0
+        
+        with open(filepath, 'r') as f:
+            tokens = json.load(f)
+        
+        if not isinstance(tokens, list):
+            tokens = [tokens]
+        
+        valid_tokens = []
+        expired_count = 0
+        
+        for token_dict in tokens:
+            token_str = token_dict.get('token', '')
+            health = get_token_health(token_str)
+            
+            if health and health['is_valid']:
+                valid_tokens.append(token_dict)
+            else:
+                expired_count += 1
+                if health:
+                    print(f"  🗑️  Removing expired token: {health.get('nickname', 'N/A')} (expired {abs(health['days_left'])} days ago)")
+        
+        # Write back cleaned tokens
+        if valid_tokens:
+            with open(filepath, 'w') as f:
+                json.dump(valid_tokens, f, indent=2)
+        else:
+            # If no valid tokens remaining, delete the file
+            if os.path.exists(filepath):
+                os.remove(filepath)
+        
+        return len(valid_tokens), expired_count
+    
+    except Exception as e:
+        print(f"Error cleaning up {filepath}: {e}")
+        return 0, 0
+
+def cleanup_all_expired_tokens():
+    """Clean expired tokens from all token files"""
+    token_files = [
+        'token_bd.json', 'token_bd_visit.json',
+        'token_ind.json', 'token_ind_visit.json',
+        'token_br.json', 'token_br_visit.json'
+    ]
+    
+    total_valid = 0
+    total_expired = 0
+    
+    print("\n🧹 CLEANING EXPIRED TOKENS...")
+    print("="*60)
+    
+    for filepath in token_files:
+        if os.path.exists(filepath):
+            valid, expired = cleanup_expired_tokens(filepath)
+            if expired > 0 or valid > 0:
+                print(f"📄 {filepath}: {valid} valid, {expired} expired removed")
+                total_valid += valid
+                total_expired += expired
+    
+    print("="*60)
+    if total_expired > 0:
+        print(f"✅ Cleanup complete: {total_expired} expired tokens removed, {total_valid} valid tokens kept")
+    else:
+        print("✅ All tokens are fresh!")
+    print("="*60 + "\n")
+    
+    return total_valid, total_expired
+
+def get_token_health_summary():
+    """Get health status of all tokens"""
+    token_files = {
+        'token_bd.json': 'Regular (BD)',
+        'token_bd_visit.json': 'Visit (BD)',
+        'token_ind.json': 'Regular (IND)',
+        'token_ind_visit.json': 'Visit (IND)',
+        'token_br.json': 'Regular (BR)',
+        'token_br_visit.json': 'Visit (BR)'
+    }
+    
+    summary = {}
+    
+    for filepath, label in token_files.items():
+        if not os.path.exists(filepath):
+            continue
+        
+        try:
+            with open(filepath, 'r') as f:
+                tokens = json.load(f)
+            
+            if not isinstance(tokens, list):
+                tokens = [tokens]
+            
+            valid = 0
+            expired = 0
+            min_days = float('inf')
+            max_days = -float('inf')
+            
+            for token_dict in tokens:
+                token_str = token_dict.get('token', '')
+                health = get_token_health(token_str)
+                
+                if health:
+                    if health['is_valid']:
+                        valid += 1
+                        min_days = min(min_days, health['days_left'])
+                        max_days = max(max_days, health['days_left'])
+                    else:
+                        expired += 1
+            
+            summary[label] = {
+                'total': len(tokens),
+                'valid': valid,
+                'expired': expired,
+                'min_days': min_days if min_days != float('inf') else 0,
+                'max_days': max_days if max_days != -float('inf') else 0,
+                'health': '✅ GOOD' if expired == 0 else ('⚠️  NEEDS_REFRESH' if expired > 0 else '❌ EXPIRED')
+            }
+        except Exception as e:
+            print(f"Error reading {filepath}: {e}")
+    
+    return summary
+
 def load_tokens(server_name, for_visit=False):
     if for_visit:
         if server_name == "IND":
@@ -91,8 +254,31 @@ def load_tokens(server_name, for_visit=False):
         with open(path, "r") as f:
             tokens = json.load(f)
             if isinstance(tokens, list) and all(isinstance(t, dict) and "token" in t for t in tokens):
-                print(f"Loaded {len(tokens)} tokens from {path} for server {server_name}")
-                return tokens
+                # Auto-cleanup: Remove expired tokens before using
+                valid_tokens = []
+                expired_count = 0
+                
+                for token_dict in tokens:
+                    token_str = token_dict.get('token', '')
+                    health = get_token_health(token_str)
+                    
+                    if health and health['is_valid']:
+                        valid_tokens.append(token_dict)
+                    else:
+                        expired_count += 1
+                
+                # Save cleaned tokens back if any were removed
+                if expired_count > 0:
+                    if valid_tokens:
+                        with open(path, 'w') as f:
+                            json.dump(valid_tokens, f, indent=2)
+                        print(f"🧹 {path}: Removed {expired_count} expired tokens, {len(valid_tokens)} valid remaining")
+                    else:
+                        os.remove(path)
+                        print(f"🧹 {path}: All tokens expired, file deleted")
+                
+                print(f"Loaded {len(valid_tokens)} valid tokens from {path} for server {server_name}")
+                return valid_tokens
             else:
                 print(f"Warning: Token file {path} is not in the expected format. Returning empty list.")
                 return []
@@ -412,6 +598,211 @@ def refresh_tokens_logic():
             "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         }
 
+def get_token_expiry_info(token_file):
+    """Extract expiry time from first token in token file"""
+    try:
+        if not os.path.exists(token_file):
+            return None
+        
+        with open(token_file, 'r') as f:
+            tokens = json.load(f)
+            if not tokens or len(tokens) == 0:
+                return None
+            
+            token_str = tokens[0].get('token', '')
+            if not token_str:
+                return None
+            
+            # Decode JWT payload
+            parts = token_str.split('.')
+            if len(parts) != 3:
+                return None
+            
+            payload = parts[1]
+            padding = 4 - len(payload) % 4
+            if padding != 4:
+                payload += '=' * padding
+            
+            try:
+                decoded = binascii.a2b_base64(payload)
+                token_data = json.loads(decoded)
+                exp_timestamp = token_data.get('exp')
+                
+                if exp_timestamp:
+                    expiry_dt = datetime.fromtimestamp(exp_timestamp)
+                    return {
+                        'expiry_timestamp': exp_timestamp,
+                        'expiry_datetime': expiry_dt,
+                        'days_remaining': (expiry_dt - datetime.now()).days,
+                        'account_id': token_data.get('account_id', 'N/A'),
+                        'nickname': token_data.get('nickname', 'N/A')
+                    }
+            except Exception as e:
+                print(f"Error decoding token payload: {e}")
+                return None
+    
+    except Exception as e:
+        print(f"Error reading token file {token_file}: {e}")
+        return None
+
+def calculate_next_refresh_time():
+    """Calculate when to refresh based on token expiry (1 day before expiry)"""
+    import os
+    
+    token_files = [
+        'token_bd.json', 'token_bd_visit.json',
+        'token_ind.json', 'token_ind_visit.json', 
+        'token_br.json', 'token_br_visit.json'
+    ]
+    
+    earliest_expiry = None
+    
+    for token_file in token_files:
+        info = get_token_expiry_info(token_file)
+        if info:
+            if earliest_expiry is None or info['expiry_timestamp'] < earliest_expiry['expiry_timestamp']:
+                earliest_expiry = info
+    
+    if earliest_expiry:
+        # Schedule refresh 1 day before expiry
+        refresh_time = datetime.fromtimestamp(earliest_expiry['expiry_timestamp']) - timedelta(days=1)
+        return refresh_time, earliest_expiry
+    
+    return None, None
+
+def refresh_visit_first_task():
+    """Background task: Refresh VISIT tokens first, then regular tokens"""
+    print(f"\n🕐 SMART REFRESH TRIGGERED at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("📋 Refreshing VISIT tokens first...")
+    
+    # First, cleanup expired tokens
+    cleanup_all_expired_tokens()
+    
+    try:
+        import sys
+        import os
+        
+        # Add token_generator to path
+        token_gen_path = os.path.join(os.path.dirname(__file__), 'token_generator')
+        if token_gen_path not in sys.path:
+            sys.path.insert(0, token_gen_path)
+        
+        from token_generator.token_gen import load_credentials_from_file, generate_token
+        
+        visit_file_creds = os.path.join(token_gen_path, 'visit.txt')
+        credentials_file = os.path.join(token_gen_path, 'credentials.txt')
+        
+        total_success = 0
+        total_failed = 0
+        
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        try:
+            # ========== STEP 1: REFRESH VISIT TOKENS FIRST ==========
+            if os.path.exists(visit_file_creds):
+                print("\n✅ STEP 1: Processing visit.txt (FIRST)")
+                visit_credentials = loop.run_until_complete(load_credentials_from_file(visit_file_creds))
+                
+                if visit_credentials:
+                    visit_file = "token_bd_visit.json"
+                    
+                    # Delete old file
+                    if os.path.exists(visit_file):
+                        os.remove(visit_file)
+                    
+                    success_count = 0
+                    for i, (uid, password) in enumerate(visit_credentials, 1):
+                        try:
+                            token_obj = loop.run_until_complete(generate_token(uid, password))
+                            
+                            if token_obj:
+                                existing = []
+                                try:
+                                    with open(visit_file, 'r') as f:
+                                        existing = json.load(f)
+                                        if not isinstance(existing, list):
+                                            existing = [existing]
+                                except FileNotFoundError:
+                                    pass
+                                
+                                existing.append(token_obj)
+                                with open(visit_file, 'w') as f:
+                                    json.dump(existing, f, indent=2)
+                                
+                                success_count += 1
+                                print(f"  ✅ Visit token {i}/{len(visit_credentials)}")
+                        except Exception as e:
+                            print(f"  ❌ Visit token {i} failed: {str(e)[:50]}")
+                        
+                        if i < len(visit_credentials):
+                            loop.run_until_complete(asyncio.sleep(2))
+                    
+                    total_success += success_count
+                    print(f"✅ Visit tokens: {success_count}/{len(visit_credentials)} refreshed")
+            
+            # ========== STEP 2: REFRESH REGULAR TOKENS SECOND ==========
+            if os.path.exists(credentials_file):
+                print("\n📋 STEP 2: Processing credentials.txt (SECOND)")
+                credentials = loop.run_until_complete(load_credentials_from_file(credentials_file))
+                
+                if credentials:
+                    output_file = "token_bd.json"
+                    
+                    if os.path.exists(output_file):
+                        os.remove(output_file)
+                    
+                    success_count = 0
+                    for i, (uid, password) in enumerate(credentials, 1):
+                        try:
+                            token_obj = loop.run_until_complete(generate_token(uid, password))
+                            
+                            if token_obj:
+                                existing = []
+                                try:
+                                    with open(output_file, 'r') as f:
+                                        existing = json.load(f)
+                                        if not isinstance(existing, list):
+                                            existing = [existing]
+                                except FileNotFoundError:
+                                    pass
+                                
+                                existing.append(token_obj)
+                                with open(output_file, 'w') as f:
+                                    json.dump(existing, f, indent=2)
+                                
+                                success_count += 1
+                                print(f"  ✅ Regular token {i}/{len(credentials)}")
+                        except Exception as e:
+                            print(f"  ❌ Regular token {i} failed: {str(e)[:50]}")
+                        
+                        if i < len(credentials):
+                            loop.run_until_complete(asyncio.sleep(2))
+                    
+                    total_success += success_count
+                    print(f"✅ Regular tokens: {success_count}/{len(credentials)} refreshed")
+            
+            # Get next refresh time
+            next_refresh, expiry_info = calculate_next_refresh_time()
+            
+            print("\n" + "="*60)
+            print("✅ REFRESH COMPLETE")
+            print("="*60)
+            if expiry_info:
+                print(f"Next token expiry: {expiry_info['expiry_datetime'].strftime('%Y-%m-%d %H:%M:%S')}")
+                print(f"Days remaining: {expiry_info['days_remaining']}")
+                if next_refresh:
+                    print(f"Next refresh scheduled: {next_refresh.strftime('%Y-%m-%d %H:%M:%S')}")
+            
+            return total_success
+        
+        finally:
+            loop.close()
+    
+    except Exception as e:
+        print(f"❌ Smart refresh failed: {e}")
+        return 0
+
 def refresh_tokens_task():
     """Background task to refresh tokens automatically"""
     print(f"\n🕐 AUTO REFRESH TRIGGERED at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
@@ -431,24 +822,33 @@ app = Flask(__name__)
 scheduler = BackgroundScheduler()
 scheduler.start()
 
-# Schedule token refresh every 8 hours
-scheduler.add_job(
-    func=refresh_tokens_task,
-    trigger="interval",
-    hours=2,
-    id='token_refresh_job',
-    name='Auto Token Refresh',
-    replace_existing=True
-)
+# Get initial refresh time based on token expiry
+next_refresh_time, expiry_info = calculate_next_refresh_time()
 
-# Run token refresh on startup (optional - comment out if not needed)
-scheduler.add_job(
-    func=refresh_tokens_task,
-    trigger="date",
-    run_date=datetime.now(),
-    id='startup_refresh',
-    name='Startup Token Refresh'
-)
+if next_refresh_time:
+    print(f"\n🕐 Token expiry detected: {expiry_info['expiry_datetime'].strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"📅 Scheduled refresh at: {next_refresh_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # Schedule based on token expiry time
+    scheduler.add_job(
+        func=refresh_visit_first_task,
+        trigger="date",
+        run_date=next_refresh_time,
+        id='expiry_based_refresh',
+        name='Expiry-Based Token Refresh',
+        replace_existing=True
+    )
+else:
+    # Fallback: refresh every 24 hours if no tokens found
+    print("⚠️  No tokens found. Scheduling fallback refresh every 24 hours...")
+    scheduler.add_job(
+        func=refresh_visit_first_task,
+        trigger="interval",
+        hours=24,
+        id='fallback_refresh',
+        name='Fallback Token Refresh',
+        replace_existing=True
+    )
 
 # Shut down the scheduler when exiting the app
 atexit.register(lambda: scheduler.shutdown())
@@ -923,12 +1323,63 @@ def refresh_tokens_logic():
 
 @app.route('/refresh_tokens', methods=['POST', 'GET'])
 def refresh_tokens():
-    """Endpoint to refresh tokens by running token generation"""
-    result = refresh_tokens_logic()
+    """Endpoint to refresh tokens - VISIT first, then REGULAR"""
+    print("\n📡 API: /refresh_tokens triggered")
+    success = refresh_visit_first_task()
     
-    if result.get("status") == "error":
-        return jsonify(result), 500
-    return jsonify(result)
+    return jsonify({
+        "status": "success" if success > 0 else "completed",
+        "message": f"Refreshed {success} tokens (visit first, then regular)",
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+@app.route('/next_refresh_info', methods=['GET'])
+def next_refresh_info():
+    """Get info about next scheduled token refresh"""
+    next_refresh_time, expiry_info = calculate_next_refresh_time()
+    
+    if not expiry_info:
+        return jsonify({
+            "status": "no_tokens",
+            "message": "No tokens found in system",
+            "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        })
+    
+    return jsonify({
+        "status": "scheduled",
+        "token_expiry": expiry_info['expiry_datetime'].strftime('%Y-%m-%d %H:%M:%S'),
+        "days_remaining": expiry_info['days_remaining'],
+        "account_id": str(expiry_info['account_id']),
+        "nickname": expiry_info['nickname'],
+        "next_refresh_time": next_refresh_time.strftime('%Y-%m-%d %H:%M:%S') if next_refresh_time else None,
+        "refresh_strategy": "Visit tokens first, then regular tokens",
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
+
+@app.route('/token_health', methods=['GET'])
+def token_health():
+    """Get health status of all tokens"""
+    summary = get_token_health_summary()
+    
+    return jsonify({
+        "status": "ok",
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "tokens": summary
+    })
+
+@app.route('/cleanup_tokens', methods=['POST', 'GET'])
+def cleanup_tokens():
+    """Manually cleanup expired tokens"""
+    print("\n📡 API: /cleanup_tokens triggered")
+    valid, expired = cleanup_all_expired_tokens()
+    
+    return jsonify({
+        "status": "success",
+        "message": f"Cleanup complete: {expired} expired removed, {valid} valid kept",
+        "valid_tokens": valid,
+        "expired_tokens_removed": expired,
+        "timestamp": datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    })
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5001, debug=True, use_reloader=False)
