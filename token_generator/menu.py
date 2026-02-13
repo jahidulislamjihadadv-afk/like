@@ -26,11 +26,12 @@ async def auto_batch_generate():
     print("\n🚀 AUTOMATIC BATCH TOKEN GENERATION\n")
     
     # Check if credentials files exist
+   visit_file_creds = "visit.txt"
     credentials_file = "credentials.txt"
-    visit_file_creds = "visit.txt"
     
-    has_credentials = os.path.exists(credentials_file)
     has_visit = os.path.exists(visit_file_creds)
+    has_credentials = os.path.exists(credentials_file)
+    
     
     if not has_credentials and not has_visit:
         print("❌ No credential files found!")
@@ -45,8 +46,9 @@ async def auto_batch_generate():
     from token_gen import load_credentials_from_file, generate_token
     
     # Define output file paths (parent directory)
+   visit_file = os.path.join("..", "token_bd_visit.json")
     output_file = os.path.join("..", "token_bd.json")
-    visit_file = os.path.join("..", "token_bd_visit.json")
+    
     
     # ========== PROCESS REGULAR TOKENS (credentials.txt) ==========
     if has_credentials:
@@ -245,3 +247,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n👋 Goodbye!\n")
         sys.exit(0)
+
