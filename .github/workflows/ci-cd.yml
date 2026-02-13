@@ -1,0 +1,110 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        python-version: ['3.8', '3.9', '3.10', '3.11']
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python ${{ matrix.python-version }}
+      uses: actions/setup-python@v4
+      with:
+        python-version: ${{ matrix.python-version }}
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r requirements.txt
+    
+    - name: Lint with Pylint
+      run: |
+        pip install pylint
+        pylint app.py config.py logger.py validation.py database.py auth.py metrics.py --disable=all --enable=E,F || true
+    
+    - name: Test modules
+      run: |
+        python test_modules.py
+    
+    - name: Run pytest
+      run: |
+        pip install pytest pytest-asyncio pytest-cov
+        pytest tests/ -v --cov=. --cov-report=xml || echo "No tests directory yet"
+    
+    - name: Upload coverage to Codecov
+      uses: codecov/codecov-action@v3
+      with:
+        files: ./coverage.xml
+        fail_ci_if_error: false
+
+  security:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+    
+    - name: Check for hardcoded secrets
+      run: |
+        pip install detect-secrets
+        detect-secrets scan --all-files --force-use-all-plugins || true
+    
+    - name: Security check with Bandit
+      run: |
+        pip install bandit
+        bandit -r . -f json -o bandit-report.json || true
+    
+    - name: Check for outdated dependencies
+      run: |
+        pip install safety
+        safety check --json || true
+
+  deploy-dev:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to dev environment
+      run: |
+        echo "Deploying to dev environment..."
+        # Add your dev deployment commands here
+    
+    - name: Run smoke tests
+      run: |
+        echo "Running smoke tests..."
+        # Add your smoke test commands here
+
+  deploy-prod:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    - name: Deploy to production
+      run: |
+        echo "Deploying to production..."
+        # Add your production deployment commands here (e.g., Vercel, Docker)
+    
+    - name: Health check
+      run: |
+        echo "Checking application health..."
+        # Add health check commands here

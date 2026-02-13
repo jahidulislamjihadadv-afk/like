@@ -7,3 +7,7 @@ protobuf
 Werkzeug
 firebase-admin
 APScheduler
+Flask-Limiter
+python-dotenv
+pytest
+pytest-asyncio
